@@ -8,17 +8,49 @@ resume.pdf
 
 # Runtime artifacts
 *.db
+*.db-shm
+*.db-wal
 tailored_resumes/
 cover_letters/
 chrome-workers/
 apply-workers/
-apply_logs/
+Review/
+artifacts/
+scratch/
 logs/
+*.log
+*.png
+*.html
+*.txt
+!README.md
+!CHANGELOG.md
+!CONTRIBUTING.md
+!LICENSE
+!pyproject.toml
+
+# Scratch / Debug scripts (keep root clean)
+check_*.py
+debug_*.py
+test_*.py
+temp_*.py
+insert_*.py
+reset_*.py
+db_*.py
+update_*.py
+query_*.py
+fetch_*.py
+fix_*.py
+rescore_*.py
+patch_*.py
+schema.py
+helpers.py
 
 # MCP configs (per-machine)
 .mcp*.json
 
 # Python
+venv/
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class

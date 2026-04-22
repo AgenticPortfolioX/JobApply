@@ -1,7 +1,7 @@
-"""Apply orchestration: acquire jobs, spawn Claude Code sessions, track results.
+"""Apply orchestration: acquire jobs, launch Gemini-powered workers, track results.
 
 This is the main entry point for the apply pipeline. It pulls jobs from
-the database, launches Chrome + Claude Code for each one, parses the
+the database, launches Chrome + Gemini Driver for each one, parses the
 result, and updates the database. Supports parallel workers via --workers.
 """
 
@@ -36,6 +36,38 @@ from applypilot.apply.dashboard import (
     render_full, get_totals,
 )
 
+# known aggregator/spam/dead-end sites that shouldn't be processed
+BLOCKLIST_DOMAINS = {
+    "flexionis.wuaze.com",
+    "remotejobs.victorytuitions.in",
+    "victorytuitions.in"
+}
+
+def is_blocklisted(url: str) -> bool:
+    if not url:
+        return False
+    from urllib.parse import urlparse
+    netloc = urlparse(url).netloc.lower()
+    for domain in BLOCKLIST_DOMAINS:
+        if netloc == domain or netloc.endswith("." + domain):
+            return True
+    return False
+
+def _prompt_user_approval(port: int, job: dict):
+    print(f"\n\n==================================================")
+    print(f"PAUSED FOR APPROVAL: {job['title']} at {job.get('site')}")
+    print(f"Please inspect Chrome on port {port}.")
+    print(f"Type 'y' to SUBMIT, or 'n' to REJECT, then press Enter: ", end="", flush=True)
+    
+    ans = sys.stdin.readline().strip().lower()
+    
+    # Send a request to the browser if needed, or rely on the user to manually click
+    if ans == 'y':
+        logger.info("User approved submission.")
+        # We assume user clicked submit in the UI
+    else:
+        logger.info("User rejected submission.")
+
 logger = logging.getLogger(__name__)
 
 # Blocked sites loaded from config/sites.yaml
@@ -49,9 +81,9 @@ POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
 
-# Track active Claude Code processes for skip (Ctrl+C) handling
-_claude_procs: dict[int, subprocess.Popen] = {}
-_claude_lock = threading.Lock()
+# Track active worker processes/threads
+_active_workers: dict[int, any] = {}
+_worker_lock = threading.Lock()
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -71,6 +103,7 @@ def _make_mcp_config(cdp_port: int) -> dict:
                 "command": "npx",
                 "args": [
                     "@playwright/mcp@latest",
+                    "-y",
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
                     f"--viewport-size={config.DEFAULTS['viewport']}",
                 ],
@@ -87,7 +120,7 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # Database operations
 # ---------------------------------------------------------------------------
 
-def acquire_job(target_url: str | None = None, min_score: int = 7,
+def acquire_job(target_url: str | None = None, min_score: int = 6,
                 worker_id: int = 0) -> dict | None:
     """Atomically acquire the next job to apply to.
 
@@ -100,76 +133,80 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         Job dict or None if the queue is empty.
     """
     conn = get_connection()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
 
-        if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
-                LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
-        else:
-            blocked_sites, blocked_patterns = _load_blocked()
-            # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
-            site_clause = ""
-            if blocked_sites:
-                placeholders = ",".join("?" * len(blocked_sites))
-                site_clause = f"AND site NOT IN ({placeholders})"
-                params.extend(blocked_sites)
-            url_clauses = ""
-            if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
-                params.extend(blocked_patterns)
-            row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
-                  {site_clause}
-                  {url_clauses}
-                ORDER BY fit_score DESC, url
-                LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            if target_url:
+                like = f"%{target_url.split('?')[0].rstrip('/')}%"
+                row = conn.execute("""
+                    SELECT url, title, site, application_url, tailored_resume_path,
+                           fit_score, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
+                      AND tailored_resume_path IS NOT NULL
+                      AND apply_status IS NULL
+                    LIMIT 1
+                """, (target_url, target_url, like, like)).fetchone()
+            else:
+                blocked_sites, blocked_patterns = _load_blocked()
+                params: list = [min_score]
+                site_clause = ""
+                if blocked_sites:
+                    placeholders = ",".join(["?"] * len(blocked_sites))
+                    site_clause = f"AND site NOT IN ({placeholders})"
+                    params.extend(blocked_sites)
+                url_clauses = ""
+                if blocked_patterns:
+                    url_clauses = " ".join(f"AND (url NOT LIKE ? AND application_url NOT LIKE ?)" for _ in blocked_patterns)
+                    # Extend params with two copies of each pattern (one for url, one for application_url)
+                    for p in blocked_patterns:
+                        params.extend([p, p])
+                row = conn.execute(f"""
+                    SELECT url, title, site, application_url, tailored_resume_path,
+                           fit_score, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE tailored_resume_path IS NOT NULL
+                      AND apply_status IS NULL
+                      AND (apply_attempts IS NULL OR apply_attempts < ?)
+                      AND fit_score >= ?
+                      {site_clause}
+                      {url_clauses}
+                    ORDER BY fit_score DESC, url
+                    LIMIT 1
+                """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
-        if not row:
-            conn.rollback()
-            return None
+            if not row:
+                conn.rollback()
+                return None
 
-        # Skip manual ATS sites (unsolvable CAPTCHAs)
-        from applypilot.config import is_manual_ats
-        apply_url = row["application_url"] or row["url"]
-        if is_manual_ats(apply_url):
-            conn.execute(
-                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
-                (row["url"],),
-            )
+            # Skip manual ATS sites (unsolvable CAPTCHAs)
+            from applypilot.config import is_manual_ats
+            apply_url = row["application_url"] or row["url"]
+            if is_manual_ats(apply_url):
+                logger.info("Skipping manual ATS: %s", row["url"][:80])
+                conn.execute(
+                    "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                    (row["url"],),
+                )
+                conn.commit()
+                # LOOP AGAIN to find the next job
+                if target_url: return None # No point looping on target url
+                continue
+
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute("""
+                UPDATE jobs SET apply_status = 'in_progress',
+                               agent_id = ?,
+                               last_attempted_at = ?
+                WHERE url = ?
+            """, (f"worker-{worker_id}", now, row["url"]))
             conn.commit()
-            logger.info("Skipping manual ATS: %s", row["url"][:80])
-            return None
 
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'in_progress',
-                           agent_id = ?,
-                           last_attempted_at = ?
-            WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
-        conn.commit()
-
-        return dict(row)
-    except Exception:
-        conn.rollback()
-        raise
+            return dict(row)
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def mark_result(url: str, status: str, error: str | None = None,
@@ -210,7 +247,7 @@ def release_lock(url: str) -> None:
 # Utility modes (--gen, --mark-applied, --mark-failed, --reset-failed)
 # ---------------------------------------------------------------------------
 
-def gen_prompt(target_url: str, min_score: int = 7,
+def gen_prompt(target_url: str, min_score: int = 6,
                model: str = "sonnet", worker_id: int = 0) -> Path | None:
     """Generate a prompt file and print the Claude CLI command for manual debugging.
 
@@ -295,8 +332,8 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
-    """Spawn a Claude Code session for one job application.
+            model: str = "gemini-flash-latest", dry_run: bool = False, pause_for_approval: bool = False) -> tuple[str, int]:
+    """Launch a Gemini application driver for one job assignment.
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
@@ -310,209 +347,58 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    # Build the prompt
     agent_prompt = prompt_mod.build_prompt(
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
+        pause_for_approval=pause_for_approval,
     )
 
-    # Write per-worker MCP config
-    mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
-    mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
-
-    # Build claude command
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
-
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-
-    worker_dir = reset_worker_dir(worker_id)
+    # All applications now use the Gemini Vision-Action Driver
+    app_url = job.get("application_url") or job.get("url")
+    if is_blocklisted(app_url):
+        add_event(f"[W{worker_id}] SKIPPING: Blocklisted domain ({app_url[:40]})")
+        update_state(worker_id, status="failed", last_action="BLOCKLISTED_DOMAIN")
+        return "failed:blocklisted_domain", 0
 
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
-                 start_time=time.time(), actions=0, last_action="starting")
-    add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
-
-    worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
-    ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_header = (
-        f"\n{'=' * 60}\n"
-        f"[{ts_header}] {job['title']} @ {job.get('site', '')}\n"
-        f"URL: {job.get('application_url') or job['url']}\n"
-        f"Score: {job.get('fit_score', 'N/A')}/10\n"
-        f"{'=' * 60}\n"
-    )
-
-    start = time.time()
-    stats: dict = {}
-    proc = None
-
+                 start_time=time.time(), actions=0, last_action="starting_gemini")
+    add_event(f"[W{worker_id}] Starting Gemini Driver: {job['title'][:40]}")
+    
+    from applypilot.apply.gemini_driver import run_gemini_apply
+    
+    start_time = time.time()
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            cwd=str(worker_dir),
+        # The Gemini driver handles its own browser connection and action loop
+        result_status, duration_ms = run_gemini_apply(
+            worker_id=worker_id,
+            job=job,
+            tailored_resume=resume_text,
+            prompt_text=agent_prompt,
+            port=port,
+            pause_for_approval=pause_for_approval
         )
-        with _claude_lock:
-            _claude_procs[worker_id] = proc
-
-        proc.stdin.write(agent_prompt)
-        proc.stdin.close()
-
-        text_parts: list[str] = []
-        with open(worker_log, "a", encoding="utf-8") as lf:
-            lf.write(log_header)
-
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                    msg_type = msg.get("type")
-                    if msg_type == "assistant":
-                        for block in msg.get("message", {}).get("content", []):
-                            bt = block.get("type")
-                            if bt == "text":
-                                text_parts.append(block["text"])
-                                lf.write(block["text"] + "\n")
-                            elif bt == "tool_use":
-                                name = (
-                                    block.get("name", "")
-                                    .replace("mcp__playwright__", "")
-                                    .replace("mcp__gmail__", "gmail:")
-                                )
-                                inp = block.get("input", {})
-                                if "url" in inp:
-                                    desc = f"{name} {inp['url'][:60]}"
-                                elif "ref" in inp:
-                                    desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
-                                elif "fields" in inp:
-                                    desc = f"{name} ({len(inp['fields'])} fields)"
-                                elif "paths" in inp:
-                                    desc = f"{name} upload"
-                                else:
-                                    desc = name
-
-                                lf.write(f"  >> {desc}\n")
-                                ws = get_state(worker_id)
-                                cur_actions = ws.actions if ws else 0
-                                update_state(worker_id,
-                                             actions=cur_actions + 1,
-                                             last_action=desc[:35])
-                    elif msg_type == "result":
-                        stats = {
-                            "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
-                            "output_tokens": msg.get("usage", {}).get("output_tokens", 0),
-                            "cache_read": msg.get("usage", {}).get("cache_read_input_tokens", 0),
-                            "cache_create": msg.get("usage", {}).get("cache_creation_input_tokens", 0),
-                            "cost_usd": msg.get("total_cost_usd", 0),
-                            "turns": msg.get("num_turns", 0),
-                        }
-                        text_parts.append(msg.get("result", ""))
-                except json.JSONDecodeError:
-                    text_parts.append(line)
-                    lf.write(line + "\n")
-
-        proc.wait(timeout=300)
-        returncode = proc.returncode
-        proc = None
-
-        if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000)
-
-        output = "\n".join(text_parts)
-        elapsed = int(time.time() - start)
-        duration_ms = int((time.time() - start) * 1000)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
-        job_log.write_text(output, encoding="utf-8")
-
-        if stats:
-            cost = stats.get("cost_usd", 0)
-            ws = get_state(worker_id)
-            prev_cost = ws.total_cost if ws else 0.0
-            update_state(worker_id, total_cost=prev_cost + cost)
-
-        def _clean_reason(s: str) -> str:
-            return re.sub(r'[*`"]+$', '', s).strip()
-
-        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
-            if f"RESULT:{result_status}" in output:
-                add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
-                update_state(worker_id, status=result_status.lower(),
-                             last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
-
-        if "RESULT:FAILED" in output:
-            for out_line in output.split("\n"):
-                if "RESULT:FAILED" in out_line:
-                    reason = (
-                        out_line.split("RESULT:FAILED:")[-1].strip()
-                        if ":" in out_line[out_line.index("FAILED") + 6:]
-                        else "unknown"
-                    )
-                    reason = _clean_reason(reason)
-                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue"}
-                    if reason in PROMOTE_TO_STATUS:
-                        add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
-                        update_state(worker_id, status=reason,
-                                     last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
-                    add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
-                    update_state(worker_id, status="failed",
-                                 last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
-
-        add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line", duration_ms
-
-    except subprocess.TimeoutExpired:
-        duration_ms = int((time.time() - start) * 1000)
-        elapsed = int(time.time() - start)
-        add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms
+        
+        # Log and update state based on driver result
+        elapsed = int(time.time() - start_time)
+        display_status = result_status.split(':')[0]
+        
+        add_event(f"[W{worker_id}] {result_status.upper()} ({elapsed}s): {job['title'][:30]}")
+        update_state(worker_id, status=display_status, 
+                     last_action=f"{result_status.upper()} ({elapsed}s)")
+        
+        return result_status, duration_ms
+        
     except Exception as e:
-        duration_ms = int((time.time() - start) * 1000)
+        logger.exception("Gemini driver fatal error")
+        duration_ms = int((time.time() - start_time) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
-        update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
+        update_state(worker_id, status="failed", last_action="driver_crash")
+        return f"failed:crash_{str(e)[:50]}", duration_ms
     finally:
-        with _claude_lock:
-            _claude_procs.pop(worker_id, None)
-        if proc is not None and proc.poll() is None:
-            _kill_process_tree(proc.pid)
+        with _worker_lock:
+            _active_workers.pop(worker_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +412,7 @@ PERMANENT_FAILURES: set[str] = {
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    "no_form_found", "repetition_detected", "aborted",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
@@ -533,11 +420,21 @@ PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by
 
 def _is_permanent_failure(result: str) -> bool:
     """Determine if a failure should never be retried."""
-    reason = result.split(":", 1)[-1] if ":" in result else result
+    if not result:
+        return False
+        
+    result_lower = result.lower()
+    # Check for direct matches or prefixed codes
+    reason = result_lower.split(":", 1)[-1] if ":" in result_lower else result_lower
+    
+    # Also check if it's already marked as 99 in result (unlikely here but safe)
+    if "99" in result_lower: return True
+
     return (
-        result in PERMANENT_FAILURES
+        result_lower in PERMANENT_FAILURES
         or reason in PERMANENT_FAILURES
         or any(reason.startswith(p) for p in PERMANENT_PREFIXES)
+        or any(result_lower.startswith(p) for p in PERMANENT_PREFIXES)
     )
 
 
@@ -547,8 +444,8 @@ def _is_permanent_failure(result: str) -> bool:
 
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
-                min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                min_score: int = 6, headless: bool = False,
+                model: str = "sonnet", dry_run: bool = False, pause_for_approval: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -585,8 +482,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 update_state(worker_id, status="done", last_action="queue empty")
                 break
             empty_polls += 1
-            update_state(worker_id, status="idle",
-                         last_action=f"polling ({empty_polls})")
+            if empty_polls % 50 == 0: # Only log every 50 polls to reduce spam
+                update_state(worker_id, status="idle",
+                             last_action=f"polling ({empty_polls})")
             if empty_polls == 1:
                 add_event(f"[W{worker_id}] Queue empty, polling every {POLL_INTERVAL}s...")
             # Use Event.wait for interruptible sleep
@@ -602,7 +500,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                            model=model, dry_run=dry_run)
+                                            model=model, dry_run=dry_run, pause_for_approval=pause_for_approval)
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -629,8 +527,17 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
             continue
         except Exception as e:
-            logger.exception("Worker %d launcher error", worker_id)
-            add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
+            import traceback
+            error_msg = f"FATAL WORKER ERROR: {str(e)}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            # Log to worker file if possible
+            worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
+            try:
+                with open(worker_log, "a", encoding="utf-8") as lf:
+                    lf.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
+            except:
+                pass
+            add_event(f"[W{worker_id}] CRASH: {str(e)[:40]}")
             release_lock(job["url"])
             failed += 1
             update_state(worker_id, jobs_failed=failed)
@@ -642,6 +549,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         if target_url:
             break
 
+        # Cool-down between jobs to prevent Chrome from spawning every second
+        # when jobs fail fast (e.g. same-file errors, connection issues, etc.)
+        if not _stop_event.wait(timeout=5):
+            pass  # 5-second pause between each job attempt
+
     update_state(worker_id, status="done", last_action="finished")
     return applied, failed
 
@@ -651,9 +563,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = False, model: str = "sonnet",
+         min_score: int = 6, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1) -> None:
+         poll_interval: int = 60, workers: int = 1, pause_for_approval: bool = False) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -696,89 +608,102 @@ def main(limit: int = 1, target_url: str | None = None,
         nonlocal _ctrl_c_count
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
-            console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
-            # Kill all active Claude processes to skip current jobs
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
-                    if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
-        else:
-            console.print("\n[red bold]STOPPING[/red bold]")
+            console.print("\n[yellow]Stopping workers... (Ctrl+C again to force quit)[/yellow]")
             _stop_event.set()
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
-                    if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
+        else:
+            console.print("\n[red bold]EMERGENCY STOP[/red bold]")
+            _stop_event.set()
             kill_all_chrome()
             raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
     try:
-        with Live(render_full(), console=console, refresh_per_second=2) as live:
-            # Daemon thread for display refresh only (no business logic)
+        # Disable iterative dashboard in GUI mode to prevent terminal redraw spam
+        if os.environ.get("APPLYPILOT_GUI"):
             _dashboard_running = True
-
-            def _refresh():
-                while _dashboard_running:
-                    live.update(render_full())
-                    time.sleep(0.5)
-
-            refresh_thread = threading.Thread(target=_refresh, daemon=True)
-            refresh_thread.start()
-
+            add_event("[SYSTEM] Starting headless log stream...")
+            
             if workers == 1:
-                # Single worker — run directly in main thread
                 total_applied, total_failed = worker_loop(
-                    worker_id=0,
-                    limit=effective_limit,
-                    target_url=target_url,
-                    min_score=min_score,
-                    headless=headless,
-                    model=model,
-                    dry_run=dry_run,
+                    worker_id=0, limit=effective_limit, target_url=target_url,
+                    min_score=min_score, headless=headless, model=model,
+                    dry_run=dry_run, pause_for_approval=pause_for_approval,
                 )
             else:
-                # Multi-worker — distribute limit across workers
+                # Multi-worker logic
                 if effective_limit:
                     base = effective_limit // workers
                     extra = effective_limit % workers
-                    limits = [base + (1 if i < extra else 0)
-                              for i in range(workers)]
+                    limits = [base + (1 if i < extra else 0) for i in range(workers)]
                 else:
-                    limits = [0] * workers  # continuous mode
+                    limits = [0] * workers
 
-                with ThreadPoolExecutor(max_workers=workers,
-                                        thread_name_prefix="apply-worker") as executor:
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="apply-worker") as executor:
                     futures = {
                         executor.submit(
-                            worker_loop,
-                            worker_id=i,
-                            limit=limits[i],
-                            target_url=target_url,
-                            min_score=min_score,
-                            headless=headless,
-                            model=model,
-                            dry_run=dry_run,
-                        ): i
-                        for i in range(workers)
+                            worker_loop, i, limits[i], target_url, min_score,
+                            headless, model, dry_run, pause_for_approval
+                        ): i for i in range(workers)
                     }
-
-                    results: list[tuple[int, int]] = []
+                    results = []
                     for future in as_completed(futures):
-                        wid = futures[future]
                         try:
                             results.append(future.result())
                         except Exception:
-                            logger.exception("Worker %d crashed", wid)
+                            logger.exception("Worker crashed")
                             results.append((0, 0))
-
-                total_applied = sum(r[0] for r in results)
-                total_failed = sum(r[1] for r in results)
-
+                    total_applied = sum(r[0] for r in results)
+                    total_failed = sum(r[1] for r in results)
             _dashboard_running = False
-            refresh_thread.join(timeout=2)
-            live.update(render_full())
+        else:
+            # Interactive Terminal Dashboard
+            with Live(render_full(), console=console, refresh_per_second=2) as live:
+                _dashboard_running = True
+
+                def _refresh():
+                    while _dashboard_running:
+                        live.update(render_full())
+                        time.sleep(0.5)
+
+                refresh_thread = threading.Thread(target=_refresh, daemon=True)
+                refresh_thread.start()
+
+                if workers == 1:
+                    total_applied, total_failed = worker_loop(
+                        worker_id=0, limit=effective_limit, target_url=target_url,
+                        min_score=min_score, headless=headless, model=model,
+                        dry_run=dry_run, pause_for_approval=pause_for_approval,
+                    )
+                else:
+                    # Multi-worker logic (same as above but with live update)
+                    if effective_limit:
+                        base = effective_limit // workers
+                        extra = effective_limit % workers
+                        limits = [base + (1 if i < extra else 0) for i in range(workers)]
+                    else:
+                        limits = [0] * workers
+
+                    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="apply-worker") as executor:
+                        futures = {
+                            executor.submit(
+                                worker_loop, i, limits[i], target_url, min_score,
+                                headless, model, dry_run, pause_for_approval
+                            ): i for i in range(workers)
+                        }
+                        results = []
+                        for future in as_completed(futures):
+                            try:
+                                results.append(future.result())
+                            except Exception:
+                                logger.exception("Worker crashed")
+                                results.append((0, 0))
+                        total_applied = sum(r[0] for r in results)
+                        total_failed = sum(r[1] for r in results)
+
+                _dashboard_running = False
+                refresh_thread.join(timeout=2)
+                live.update(render_full())
 
         totals = get_totals()
         console.print(

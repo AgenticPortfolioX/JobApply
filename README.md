@@ -1,8 +1,35 @@
-<!-- logo here -->
+# ApplyPilot-Custom: Job-Hunter-Pro Edition
 
-> **⚠️ ApplyPilot** is the original open-source project, created by [Pickle-Pixel](https://github.com/Pickle-Pixel) and first published on GitHub on **February 17, 2026**. We are **not affiliated** with applypilot.app, useapplypilot.com, or any other product using the "ApplyPilot" name. These sites are **not associated with this project** and may misrepresent what they offer. If you're looking for the autonomous, open-source job application agent — you're in the right place.
+**Autonomous job searching, dynamic multi-resume selection, and Glassmorphic web control center.**
 
-# ApplyPilot
+---
+
+### 🚀 New in this Version
+
+#### 🖥️ ApplyPilot Control Center (GUI)
+A stunning, glassmorphic local web dashboard to manage your entire funnel. Skip the terminal and visualize your progress.
+- **Funnel Dashboard**: Real-time stats from your job discovery and application history.
+- **Split-Pane Reviewer**: Preview Stage 5/6 assets (Job Descriptions vs Tailored Resumes) before applying.
+- **Execution Hub**: One-click launch for all jobs scoring 8+.
+- **Live Terminal Emulator**: Stream "Claude Code" navigation logs directly into the web UI.
+- **Approval Hook**: Intercept the "Submit" prompt with a Big Green Button in the GUI.
+
+```bash
+# Launch the Control Center
+python -m applypilot gui
+```
+
+#### 🛡️ Job-Hunter-Pro Workflow
+A specialized logic engine designed for high-precision institutional and technical roles.
+- **Dynamic Persona Selection**: Automatically analyzes job descriptions to select the best "Base" resume (Compliance, MBA Finance, Corporate Advance, Accounting, AML Specialist).
+- **Hardfit Scoring**: Only applies to jobs scoring **8/10** or higher.
+- **Manual Review Diversion**: Automatically routes **6-7** score jobs to a `Review/` folder for human oversight instead of applying.
+- **Pause for Approval**: Takes a full-page Python CDP screenshot of the final filled form and waits for your terminal/GUI input before the final "Submit" click.
+
+---
+
+# Original ApplyPilot Documentation
+
 
 **Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
 

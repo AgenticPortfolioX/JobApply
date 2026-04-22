@@ -5,8 +5,43 @@ import platform
 import shutil
 from pathlib import Path
 
+# ── Early dotenv bootstrap ────────────────────────────────────────────────
+# Load .env before APP_DIR is computed so APPLYPILOT_DIR is available even
+# when the CLI is invoked from outside the project directory.
+# Searches: CWD, then parent dirs of this file, stopping at first .env found.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _loaded = False
+
+    # 1. Try CWD first (handles `cd ApplyPilot-Custom && python -m applypilot`)
+    _cwd_env = Path.cwd() / ".env"
+    if _cwd_env.exists():
+        _load_dotenv(_cwd_env, override=False)
+        _loaded = True
+
+    # 2. Walk up from this file to find the project .env
+    # config.py is at: src/applypilot/config.py
+    # ApplyPilot-Custom/.env is 3 levels up: parent.parent.parent
+    _this_file = Path(__file__).resolve()
+    for _nlevels in (3, 4, 5):
+        _candidate = _this_file.parents[_nlevels - 1] / ".env"
+        if _candidate.exists():
+            _load_dotenv(_candidate, override=False)
+            break
+except ImportError:
+    pass  # dotenv not installed yet — will be handled by ensure_dirs/load_env
+
+
 # User data directory — all user-specific files live here
-APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
+_env_dir = os.environ.get("APPLYPILOT_DIR")
+if _env_dir:
+    APP_DIR = Path(_env_dir)
+else:
+    # Default to CWD if we're in the project, otherwise ~/.applypilot
+    if (Path.cwd() / "src/applypilot").exists():
+        APP_DIR = Path.cwd()
+    else:
+        APP_DIR = Path.home() / ".applypilot"
 
 # Core paths
 DB_PATH = APP_DIR / "applypilot.db"
@@ -20,6 +55,7 @@ ENV_PATH = APP_DIR / ".env"
 TAILORED_DIR = APP_DIR / "tailored_resumes"
 COVER_LETTER_DIR = APP_DIR / "cover_letters"
 LOG_DIR = APP_DIR / "logs"
+REVIEW_DIR = APP_DIR / "Review"
 
 # Chrome worker isolation
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
@@ -87,7 +123,7 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [APP_DIR, TAILORED_DIR, REVIEW_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -168,6 +204,8 @@ DEFAULTS = {
     "poll_interval": 60,
     "apply_timeout": 300,
     "viewport": "1280x900",
+    "apply_engine": os.environ.get("APPLY_ENGINE", "gemini"),
+    "apply_model": os.environ.get("APPLY_MODEL", "gemini-2.5-flash"),
 }
 
 

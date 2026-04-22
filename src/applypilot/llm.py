@@ -35,7 +35,7 @@ def _detect_provider() -> tuple[str, str, str]:
     if gemini_key and not local_url:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
+            model_override or "gemini-2.5-flash",
             gemini_key,
         )
 
@@ -75,6 +75,7 @@ _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
+
 class LLMClient:
     """Thin LLM client supporting OpenAI-compatible and native Gemini endpoints.
 
@@ -88,8 +89,10 @@ class LLMClient:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
-        self._client = httpx.Client(timeout=_TIMEOUT)
+        # Disabled SSL verification for local environment (revocation check issues)
+        self._client = httpx.Client(timeout=_TIMEOUT, verify=False)
         # True once we've confirmed the native Gemini API works for this model
+
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
 
@@ -142,7 +145,29 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        candidates = data.get("candidates", [])
+        if not candidates:
+            # Prompt was blocked or no output — raise clearly so retry/fallback handles it
+            finish_reason = data.get("promptFeedback", {}).get("blockReason", "UNKNOWN")
+            raise RuntimeError(f"Gemini returned no candidates (blockReason={finish_reason})")
+        candidate = candidates[0]
+        finish_reason = candidate.get("finishReason")
+        
+        if finish_reason == "SAFETY":
+            raise RuntimeError("Gemini blocked the response due to safety filters.")
+        
+        content = candidate.get("content", {})
+        parts = content.get("parts", [])
+        if not parts:
+            raise RuntimeError(f"Gemini candidate has no parts (finishReason={finish_reason or 'UNKNOWN'})")
+            
+        text = "".join(p.get("text", "") for p in parts)
+        text = _strip_thinking(text)
+        
+        if finish_reason == "MAX_TOKENS":
+            log.warning("Gemini response truncated: reached MAX_TOKENS limit (%d)", max_tokens)
+            
+        return text
 
     # -- OpenAI-compat API --------------------------------------------------
 
@@ -170,9 +195,9 @@ class LLMClient:
             headers=headers,
         )
 
-        # 403 on Gemini compat = model not available on compat layer.
+        # 403 or 404 on Gemini compat = model not available on compat layer.
         # Raise a specific sentinel so chat() can switch to native API.
-        if resp.status_code == 403 and self._is_gemini:
+        if resp.status_code in (403, 404) and self._is_gemini:
             raise _GeminiCompatForbidden(resp)
 
         return self._handle_compat_response(resp)
@@ -181,7 +206,8 @@ class LLMClient:
     def _handle_compat_response(resp: httpx.Response) -> str:
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        text = data["choices"][0]["message"]["content"]
+        return _strip_thinking(text)
 
     # -- public API ---------------------------------------------------------
 
@@ -192,6 +218,10 @@ class LLMClient:
         max_tokens: int = 4096,
     ) -> str:
         """Send a chat completion request and return the assistant message text."""
+        # Force native Gemini if it's a Google API key
+        if self._is_gemini:
+            self._use_native_gemini = True
+
         # Qwen3 optimization: prepend /no_think to skip chain-of-thought
         # reasoning, saving tokens on structured extraction tasks.
         if "qwen" in self.model.lower() and messages:
@@ -206,6 +236,7 @@ class LLMClient:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
 
                 return self._chat_compat(messages, temperature, max_tokens)
+
 
             except _GeminiCompatForbidden as exc:
                 # Model not available on OpenAI-compat layer — switch to native.
@@ -278,6 +309,16 @@ class _GeminiCompatForbidden(Exception):
     def __init__(self, response: httpx.Response) -> None:
         self.response = response
         super().__init__(f"Gemini compat 403: {response.text[:200]}")
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks from the response text."""
+    if "<think>" in text:
+        # Take everything after the last </think> tag
+        parts = text.split("</think>")
+        if len(parts) > 1:
+            return parts[-1].strip()
+    return text
 
 
 # ---------------------------------------------------------------------------

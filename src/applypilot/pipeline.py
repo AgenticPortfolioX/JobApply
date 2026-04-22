@@ -96,6 +96,22 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]Smart extract error:[/red] {e}")
         stats["smartextract"] = f"error: {e}"
 
+    # Scout Import (Jobs from local database)
+    console.print("  [cyan]Scout database import...[/cyan]")
+    try:
+        from applypilot.discovery.scout_import import run_scout_import
+        scout_stats = run_scout_import()
+        stats["scout"] = scout_stats.get("status", "ok")
+        count = scout_stats.get("new", 0)
+        if count > 0:
+            console.print(f"    [green]+ Added {count} job(s) from Scout workflow.[/green]")
+        else:
+            console.print("    [dim]No new jobs found in Scout workflow.[/dim]")
+    except Exception as e:
+        log.error("Scout import failed: %s", e)
+        console.print(f"  [red]Scout import error:[/red] {e}")
+        stats["scout"] = f"error: {e}"
+
     return stats
 
 
@@ -110,33 +126,33 @@ def _run_enrich(workers: int = 1) -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_score() -> dict:
+def _run_score(workers: int = 5) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10."""
     try:
         from applypilot.scoring.scorer import run_scoring
-        run_scoring()
+        run_scoring(workers=workers)
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
+def _run_tailor(min_score: int = 6, validation_mode: str = "normal", workers: int = 5) -> dict:
     """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
     try:
         from applypilot.scoring.tailor import run_tailoring
-        run_tailoring(min_score=min_score, validation_mode=validation_mode)
+        run_tailoring(min_score=min_score, validation_mode=validation_mode, workers=workers)
         return {"status": "ok"}
     except Exception as e:
         log.error("Tailoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
+def _run_cover(min_score: int = 6, validation_mode: str = "normal", workers: int = 5) -> dict:
     """Stage: Cover letter generation."""
     try:
         from applypilot.scoring.cover_letter import run_cover_letters
-        run_cover_letters(min_score=min_score, validation_mode=validation_mode)
+        run_cover_letters(min_score=min_score, validation_mode=validation_mode, workers=workers)
         return {"status": "ok"}
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
@@ -244,7 +260,7 @@ _PENDING_SQL: dict[str, str] = {
 _STREAM_POLL_INTERVAL = 10
 
 
-def _count_pending(stage: str, min_score: int = 7) -> int:
+def _count_pending(stage: str, min_score: int = 6) -> int:
     """Count pending work items for a stage."""
     sql = _PENDING_SQL.get(stage)
     if sql is None:
@@ -259,7 +275,7 @@ def _run_stage_streaming(
     stage: str,
     tracker: _StageTracker,
     stop_event: threading.Event,
-    min_score: int = 7,
+    min_score: int = 6,
     workers: int = 1,
     validation_mode: str = "normal",
 ) -> None:
@@ -271,9 +287,11 @@ def _run_stage_streaming(
     """
     runner = _STAGE_RUNNERS[stage]
     kwargs: dict = {}
-    if stage in ("tailor", "cover"):
-        kwargs["min_score"] = min_score
-        kwargs["validation_mode"] = validation_mode
+    if stage in ("score", "tailor", "cover"):
+        kwargs["workers"] = workers
+        if stage in ("tailor", "cover"):
+            kwargs["min_score"] = min_score
+            kwargs["validation_mode"] = validation_mode
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
 
@@ -342,10 +360,13 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
         try:
             kwargs: dict = {}
-            if name in ("tailor", "cover"):
+            if name == "score":
+                kwargs["workers"] = workers
+            elif name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
                 kwargs["validation_mode"] = validation_mode
-            if name in ("discover", "enrich"):
+                kwargs["workers"] = workers
+            elif name in ("discover", "enrich"):
                 kwargs["workers"] = workers
             result = runner(**kwargs)
             elapsed = time.time() - t0
@@ -408,6 +429,22 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
         t.start()
         console.print(f"  [dim]Started thread:[/dim] {name}")
 
+    # Funnel heartbeat thread
+    def _funnel_heartbeat():
+        from applypilot.database import get_stats
+        import time
+        while not stop_event.is_set():
+            time.sleep(15)
+            if stop_event.is_set(): break
+            try:
+                stats = get_stats()
+                console.print(f"\n[bold blue] Funnel Status:[/bold blue] {stats['scored']} scored | {stats['tailored']} tailored | {stats['ready_to_apply']} ready to apply")
+            except Exception:
+                pass
+                
+    heartbeat_thread = threading.Thread(target=_funnel_heartbeat, daemon=True)
+    heartbeat_thread.start()
+
     # Wait for all threads to finish
     try:
         for name in ordered:
@@ -443,7 +480,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
 
 def run_pipeline(
     stages: list[str] | None = None,
-    min_score: int = 7,
+    min_score: int = 6,
     dry_run: bool = False,
     stream: bool = False,
     workers: int = 1,

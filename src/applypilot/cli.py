@@ -74,6 +74,23 @@ def init() -> None:
 
 
 @app.command()
+def sync() -> None:
+    """Sync jobs from the external jobs.db tracker."""
+    from applypilot.sync import sync_daily_jobs
+    
+    console.print("[bold blue]Syncing jobs from external tracker...[/bold blue]")
+    new, dups = sync_daily_jobs()
+    
+    if new > 0:
+        console.print(f"[bold green]Success![/bold green] Added {new} new jobs.")
+    else:
+        console.print("[yellow]No new jobs found.[/yellow]")
+        
+    if dups > 0:
+        console.print(f"[dim]Skipped {dups} duplicate jobs.[/dim]")
+
+
+@app.command()
 def run(
     stages: Optional[list[str]] = typer.Argument(
         None,
@@ -83,7 +100,7 @@ def run(
             "Defaults to 'all' if omitted."
         ),
     ),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
+    min_score: int = typer.Option(6, "--min-score", help="Minimum fit score for tailor/cover stages."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
@@ -146,10 +163,11 @@ def run(
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    min_score: int = typer.Option(6, "--min-score", help="Minimum fit score for job selection."),
+    model: str = typer.Option("gemini-2.5-flash", "--model", "-m", help="Gemini model name (using vision-based automation)."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    pause_for_approval: bool = typer.Option(False, "--pause-for-approval", help="Pause for terminal approval before clicking submit."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
@@ -251,6 +269,7 @@ def apply(
         headless=headless,
         model=model,
         dry_run=dry_run,
+        pause_for_approval=pause_for_approval,
         continuous=continuous,
         workers=workers,
     )
@@ -333,6 +352,22 @@ def dashboard() -> None:
 
 
 @app.command()
+def gui(
+    port: int = typer.Option(8000, "--port", help="Port to run the GUI on."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Host address."),
+) -> None:
+    """Launch the ApplyPilot Control Center (Web GUI)."""
+    _bootstrap()
+    console.print(f"Starting ApplyPilot Control Center at http://{host}:{port} ...")
+    try:
+        import uvicorn
+        uvicorn.run("applypilot.gui.server:app", host=host, port=port, log_level="info")
+    except ImportError:
+        console.print("[red]uvicorn not installed. Run: pip install fastapi uvicorn websockets python-multipart[/red]")
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
@@ -356,13 +391,26 @@ def doctor() -> None:
     else:
         results.append(("profile.json", fail_mark, "Run 'applypilot init' to create"))
 
-    # Resume
-    if RESUME_PATH.exists():
-        results.append(("resume.txt", ok_mark, str(RESUME_PATH)))
-    elif RESUME_PDF_PATH.exists():
-        results.append(("resume.txt", warn_mark, "Only PDF found — plain-text needed for AI stages"))
-    else:
-        results.append(("resume.txt", fail_mark, "Run 'applypilot init' to add your resume"))
+    # Resume / Base Resumes
+    has_base_resumes = False
+    if PROFILE_PATH.exists():
+        try:
+            import json
+            profile_data = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+            base_resumes = profile_data.get("base_resumes", {})
+            if base_resumes:
+                has_base_resumes = True
+                results.append(("base resumes", ok_mark, f"{len(base_resumes)} variants found in profile"))
+        except Exception:
+            pass
+
+    if not has_base_resumes:
+        if RESUME_PATH.exists():
+            results.append(("resume.txt", ok_mark, str(RESUME_PATH)))
+        elif RESUME_PDF_PATH.exists():
+            results.append(("resume.txt", warn_mark, "Only PDF found — plain-text needed for AI stages"))
+        else:
+            results.append(("resume.txt", fail_mark, "Run 'applypilot init' to add your resume"))
 
     # Search config
     if SEARCH_CONFIG_PATH.exists():

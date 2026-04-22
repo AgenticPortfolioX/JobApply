@@ -12,17 +12,13 @@ manual_ats:
 # ── Blocked sites — too problematic for automation ───────────────────────
 blocked:
   sites:
-    - "glassdoor"
-    - "google"
     - "accenture"
     - "AccentureCareers"
     - "Workopolis"
   url_patterns:
-    - "%glassdoor%"
-    - "%google.com/about/careers%"
-    - "%google.jobs%"
     - "%accenture%"
     - "%workopolis.com/out%"
+    - "%wuaze.com%"
 
 # ── Blocked SSO domains — cannot authenticate through these ──────────────
 blocked_sso:

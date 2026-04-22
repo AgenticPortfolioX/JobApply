@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
+from applypilot.config import RESUME_PATH, TAILORED_DIR, REVIEW_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
@@ -68,51 +68,38 @@ def _build_tailor_prompt(profile: dict) -> str:
     education = profile.get("experience", {})
     education_level = education.get("education_level", "")
 
-    return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
+    return f"""You are an elite Technical Recruiter and Resume Strategist specializing in FinTech, Risk Management, and Technical Integration. Your task is to rewrite a resume to secure an interview for the target job description. 
 
-Take the base resume and job description. Return a tailored resume as a JSON object.
+You must strictly adhere to the candidate's approved boundaries, past companies, and real metrics. Do not invent new facts. Apply the following rules to the rewrite:
 
-## RECRUITER SCAN (6 seconds):
-1. Title -- matches what they're hiring?
-2. Summary -- 2 sentences proving you've done this work
-3. First 3 bullets of most recent role -- verbs and outcomes match?
-4. Skills -- must-haves visible immediately?
+1. TITLE:
+Update the header title to exactly match the target job description.
 
-## SKILLS BOUNDARY (real skills only):
+2. PROFESSIONAL SUMMARY (High-Impact & Factual):
+Rewrite the 2-3 sentence summary from scratch. Maintain a strictly professional, authoritative tone. Avoid generic corporate buzzwords (e.g., "results-driven," "synergy," "dynamic"). 
+* Sentence 1: State the candidate's core domain expertise (e.g., Compliance, MBA Finance, AML).
+* Sentence 2: Detail the technical and operational leverage they bring (e.g., architecting automated workflows, complex data pipelines, and scalable system integrations).
+* Sentence 3: Target the specific core need of the job description.
+
+3. BULLET POINTS (The Professional Impact Formula):
+Rewrite every single bullet point to shift the angle of the work toward the target job, emphasizing technical execution and business value. You must use this exact formula:
+[Strong Action Verb] + [Technical/Process Solution Built] + [Business/Domain Problem Solved] + [Quantified Impact].
+* Example: "Architected an automated compliance engine to reconcile custodial accounts, accelerating default liquidation lifecycles by 20%."
+Ensure the focus remains on the complexity of the problems solved and the efficiency of the solutions built.
+
+4. SKILLS BOUNDARY & HARD RULES:
+Prioritize and integrate skills strictly from the provided technical stack and domain categories (Compliance, MBA Finance, Corporate Advance, Accounting, AML Specialist).
+- Allowed Skills:
 {skills_block}
-
-You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
-
-## TAILORING RULES:
-
-TITLE: Match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
-
-SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THIS role. Sound like someone who's done this job.
-
-SKILLS: Reorder each category so the job's must-haves appear first.
-
-Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim.
-
-PROJECTS: Reorder by relevance. Drop irrelevant projects entirely.
-
-BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section.
-
-## VOICE:
-- Write like a real engineer. Short, direct.
-- GOOD: "Automated financial reporting with Python + API integrations, cut processing time from 10 hours to 2"
-- BAD: "Leveraged cutting-edge AI technologies to drive transformative operational efficiencies"
-- BANNED WORDS (using ANY of these = validation failure — do not use them even once):
-  {banned_str}
-- No em dashes. Use commas, periods, or hyphens.
-
-## HARD RULES:
-- Do NOT invent work, companies, degrees, or certifications
-- Do NOT change real numbers ({metrics_str})
-- Preserved companies: {companies_str} -- names stay as-is
+- Preserved companies: {companies_str}
+- Real metrics to use: {metrics_str}
 - Preserved school: {school}
-- Must fit 1 page.
 
-## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
+BANNED WORDS (using ANY of these = validation failure — do not use them even once):
+{banned_str}
+
+5. JSON OUTPUT:
+Return a strict JSON object with the following keys exactly: Title, Summary, Skills, Experience, Projects, Education. All fields are MANDATORY. Use "N/A" for any skill categories where the candidate has no relevant experience.
 
 {{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
 
@@ -132,45 +119,16 @@ def _build_judge_prompt(profile: dict) -> str:
     real_metrics = resume_facts.get("real_metrics", [])
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
-    return f"""You are a resume quality judge. A tailoring engine rewrote a resume to target a specific job. Your job is to catch LIES, not style changes.
+    return f"""You are a ruthless Resume Quality Judge and Context Validator. Your sole job is to catch LIES, exaggerations, and unverified claims in the newly generated tailored resume by comparing it against the original base resume. 
 
-You must answer with EXACTLY this format:
-VERDICT: PASS or FAIL
-ISSUES: (list any problems, or "none")
+You will flat-out REJECT the generation and return an error noting the specific violation if you detect any of the following:
 
-## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
-- Change the title to match the target role
-- Rewrite the summary from scratch for the target job
-- Reorder bullets and projects to put the most relevant first
-- Reframe bullets to use the job's language
-- Drop low-relevance bullets and replace with more relevant ones from other sections
-- Reorder the skills section to put job-relevant skills first
-- Change tone and wording extensively
+1. UNAUTHORIZED SKILLS: Added technical skills, frameworks, or certifications not native to the original profile or approved skill weights. Allowed skills: {skills_str}
+2. INFLATED METRICS: Invented completely new metrics, changed real numbers (e.g., inflating 80% to 95%), or added quantified impact where none existed in the base data. Real metrics: {metrics_str}
+3. FAKE HISTORY: Invented new projects, degrees, or job titles not present in the original history.
 
-## WHAT IS FABRICATION (FAIL for these):
-1. Adding tools, languages, or frameworks to TECHNICAL SKILLS that aren't in the original. The allowed skills are ONLY: {skills_str}
-2. Inventing NEW metrics or numbers not in the original. The real metrics are: {metrics_str}
-3. Inventing work that has no basis in any original bullet (completely new achievements).
-4. Adding companies, roles, or degrees that don't exist.
-5. Changing real numbers (inflating 80% to 95%, 500 nodes to 1000 nodes).
-
-## WHAT IS NOT FABRICATION (do NOT fail for these):
-- Rewording any bullet, even heavily, as long as the underlying work is real
-- Combining two original bullets into one
-- Splitting one original bullet into two
-- Describing the same work with different emphasis
-- Dropping bullets entirely
-- Reordering anything
-- Changing the title or summary completely
-
-## TOLERANCE RULE:
-The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 minor stretches per resume:
-- Adding a closely related tool the candidate could realistically know is a MINOR STRETCH, not fabrication.
-- Reframing a metric with slightly different wording is a MINOR STRETCH.
-- Adding any LEARNABLE skill given their existing stack is a MINOR STRETCH.
-- Only FAIL if there are MAJOR lies: completely invented projects, fake companies, fake degrees, wildly inflated numbers, or skills from a completely different domain.
-
-Be strict about major lies. Be lenient about minor stretches and learnable skills. Do not fail for style, tone, or restructuring."""
+If the resume passes all checks, return: "APPROVED". 
+If it fails, return: "REJECTED: [Specific reason for failure]"."""
 
 
 # ── JSON Extraction ───────────────────────────────────────────────────────
@@ -259,19 +217,27 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
     lines.append("")
 
     # Summary
-    lines.append("SUMMARY")
+    lines.append("PROFESSIONAL SUMMARY")
     lines.append(sanitize_text(data["summary"]))
     lines.append("")
 
     # Technical Skills
-    lines.append("TECHNICAL SKILLS")
-    if isinstance(data["skills"], dict):
-        for cat, val in data["skills"].items():
-            lines.append(f"{cat}: {sanitize_text(str(val))}")
-    lines.append("")
+    skills_data = data.get("skills", {})
+    valid_skills = []
+    if isinstance(skills_data, dict):
+        for cat, val in skills_data.items():
+            s_val = sanitize_text(str(val)).strip()
+            # Skip if value is "N/A", "None", empty, or similar placeholder
+            if s_val and s_val.lower() not in ("n/a", "none", "(none)", "no relevant skills"):
+                valid_skills.append(f"{cat}: {s_val}")
+    
+    if valid_skills:
+        lines.append("TECHNICAL SKILLS")
+        lines.extend(valid_skills)
+        lines.append("")
 
     # Experience
-    lines.append("EXPERIENCE")
+    lines.append("PROFESSIONAL EXPERIENCE")
     for entry in data.get("experience", []):
         lines.append(sanitize_text(entry.get("header", "")))
         if entry.get("subtitle"):
@@ -326,13 +292,14 @@ def judge_tailored_resume(
     ]
 
     client = get_client()
-    response = client.chat(messages, max_tokens=512, temperature=0.1)
+    response = client.chat(messages, max_tokens=1024, temperature=0.1)
 
-    passed = "VERDICT: PASS" in response.upper()
+    upper_resp = response.upper()
+    passed = "APPROVED" in upper_resp and "REJECTED" not in upper_resp
     issues = "none"
-    if "ISSUES:" in response.upper():
-        issues_idx = response.upper().index("ISSUES:")
-        issues = response[issues_idx + 7:].strip()
+    if "REJECTED:" in upper_resp:
+        issues_idx = upper_resp.index("REJECTED:")
+        issues = response[issues_idx + 9:].strip()
 
     return {
         "passed": passed,
@@ -400,7 +367,8 @@ def tailor_resume(
             {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
-        raw = client.chat(messages, max_tokens=2048, temperature=0.4)
+        raw = client.chat(messages, max_tokens=8192, temperature=0.4)
+        print(f"DEBUG: LLM Response Length: {len(raw)} chars")
 
         # Parse JSON from response
         try:
@@ -455,38 +423,53 @@ def tailor_resume(
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_tailoring(min_score: int = 7, limit: int = 20,
-                  validation_mode: str = "normal") -> dict:
+def run_tailoring(min_score: int = 6, limit: int = 20,
+                   validation_mode: str = "normal", workers: int = 5) -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
         min_score:       Minimum fit_score to tailor for.
         limit:           Maximum jobs to process.
         validation_mode: "strict", "normal", or "lenient".
+        workers:         Number of parallel threads for tailoring.
 
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
     """
     profile = load_profile()
-    resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    base_resumes = profile.get("base_resumes", {})
+    default_resume_text = ""
+    if RESUME_PATH.exists():
+        default_resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
 
-    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
+    jobs_rows = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
 
-    if not jobs:
+    if not jobs_rows:
         log.info("No untailored jobs with score >= %d.", min_score)
         return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
 
+    # Convert rows to dicts
+    jobs = [dict(row) for row in jobs_rows]
+
     TAILORED_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
+    REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    log.info("Tailoring resumes for %d jobs using %d workers (score >= %d)...", len(jobs), workers, min_score)
     t0 = time.time()
     completed = 0
-    results: list[dict] = []
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
 
-    for job in jobs:
-        completed += 1
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _process_job(job):
+        """Worker task: tailor resume and return result."""
         try:
+            base_resume_key = job.get("base_resume_key")
+            if base_resumes and base_resume_key in base_resumes:
+                resume_text = base_resumes[base_resume_key]
+            else:
+                resume_text = default_resume_text
+
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode)
 
@@ -495,91 +478,80 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
             prefix = f"{safe_site}_{safe_title}"
 
-            # Save tailored resume text
-            txt_path = TAILORED_DIR / f"{prefix}.txt"
-            txt_path.write_text(tailored, encoding="utf-8")
-
-            # Save job description for traceability
-            job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
-            job_desc = (
-                f"Title: {job['title']}\n"
-                f"Company: {job['site']}\n"
-                f"Location: {job.get('location', 'N/A')}\n"
-                f"Score: {job.get('fit_score', 'N/A')}\n"
-                f"URL: {job['url']}\n\n"
-                f"{job.get('full_description', '')}"
-            )
-            job_path.write_text(job_desc, encoding="utf-8")
-
-            # Save validation report
+            # Save files
+            tailored_path = None
+            if tailored and len(tailored.strip()) > 0:
+                txt_path = TAILORED_DIR / f"{prefix}.txt"
+                txt_path.write_text(tailored, encoding="utf-8")
+                tailored_path = str(txt_path)
+            
+            # Save report
             report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-            # Generate PDF for approved resumes (best-effort)
-            # "approved_with_judge_warning" is also a success — resume was generated.
+            # Generate PDF
             pdf_path = None
-            if report["status"] in ("approved", "approved_with_judge_warning"):
+            if report["status"] in ("approved", "approved_with_judge_warning") and tailored_path:
                 try:
                     from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
+                    pdf_path = str(convert_to_pdf(Path(tailored_path)))
                 except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+                    pass
 
-            result = {
+            return {
                 "url": job["url"],
-                "path": str(txt_path),
+                "path": tailored_path,
                 "pdf_path": pdf_path,
                 "title": job["title"],
-                "site": job["site"],
                 "status": report["status"],
                 "attempts": report["attempts"],
             }
         except Exception as e:
-            result = {
-                "url": job["url"], "title": job["title"], "site": job["site"],
-                "status": "error", "attempts": 0, "path": None, "pdf_path": None,
+            log.error("Tailor failed for %s: %s", job["title"], e)
+            return {
+                "url": job["url"], "title": job["title"], "status": "error", "attempts": 0,
             }
-            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
-        results.append(result)
-        stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_job = {executor.submit(_process_job, job): job for job in jobs}
+        
+        for future in as_completed(future_to_job):
+            try:
+                res = future.result()
+                completed += 1
+                status = res.get("status", "error")
+                stats[status] = stats.get(status, 0) + 1
 
-        elapsed = time.time() - t0
-        rate = completed / elapsed if elapsed > 0 else 0
-        log.info(
-            "%d/%d [%s] attempts=%s | %.1f jobs/min | %s",
-            completed, len(jobs),
-            result["status"].upper(),
-            result.get("attempts", "?"),
-            rate * 60,
-            result["title"][:40],
-        )
+                # Update DB immediately
+                now = datetime.now(timezone.utc).isoformat()
+                if status in ("approved", "approved_with_judge_warning") and res.get("path"):
+                    conn.execute(
+                        "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                        "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                        (res["path"], now, res["url"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                        (res["url"],),
+                    )
+                conn.commit()
 
-    # Persist to DB: increment attempt counter for ALL, save path only for approved
-    now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning"}
-    for r in results:
-        if r["status"] in _success_statuses:
-            conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
-            )
-        else:
-            conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
+                elapsed_loop = time.time() - t0
+                rate = completed / elapsed_loop if elapsed_loop > 0 else 0
+                log.info(
+                    "%d/%d [%s] attempts=%s | %.1f jobs/min | %s",
+                    completed, len(jobs), status.upper(),
+                    res.get("attempts", "?"), rate * 60, res["title"][:40],
+                )
+            except Exception as e:
+                log.error("Future processing failed: %s", e)
 
     elapsed = time.time() - t0
     log.info(
         "Tailoring done in %.1fs: %d approved, %d failed_validation, %d failed_judge, %d errors",
-        elapsed,
-        stats.get("approved", 0),
-        stats.get("failed_validation", 0),
-        stats.get("failed_judge", 0),
-        stats.get("error", 0),
+        elapsed, stats.get("approved", 0), stats.get("failed_validation", 0),
+        stats.get("failed_judge", 0), stats.get("error", 0),
     )
 
     return {

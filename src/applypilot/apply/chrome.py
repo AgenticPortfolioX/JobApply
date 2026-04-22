@@ -246,7 +246,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
         _chrome_procs[worker_id] = proc
 
     # Give Chrome time to start and open the debug port
-    time.sleep(3)
+    time.sleep(4)
     logger.info("[worker-%d] Chrome started on port %d (pid %d)",
                 worker_id, port, proc.pid)
     return proc
